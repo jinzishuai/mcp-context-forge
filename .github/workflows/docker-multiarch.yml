@@ -66,22 +66,44 @@ env:
 jobs:
   # =============================================================
   # Build job - Matrix strategy for variant × architecture
+  # Uses native runners for each architecture (no QEMU emulation)
+  # AMD64 builds on ubuntu-24.04, ARM64 builds on ubuntu-24.04-arm
   # =============================================================
   build:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        variant:
-          - name: full
-            file: Containerfile
-            suffix: ""
-          - name: lite
-            file: Containerfile.lite
-            suffix: "-lite"
-        platform:
-          - linux/amd64
-          - linux/arm64
+        include:
+          # Full variant - AMD64
+          - variant_name: full
+            variant_file: Containerfile
+            variant_suffix: ""
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          # Full variant - ARM64
+          - variant_name: full
+            variant_file: Containerfile
+            variant_suffix: ""
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+          # Lite variant - AMD64
+          - variant_name: lite
+            variant_file: Containerfile.lite
+            variant_suffix: "-lite"
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          # Lite variant - ARM64
+          - variant_name: lite
+            variant_file: Containerfile.lite
+            variant_suffix: "-lite"
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
 
     steps:
       # -----------------------------------------------------------
@@ -99,29 +121,21 @@ jobs:
           IMAGE="${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-          # Extract architecture from platform (e.g., linux/amd64 -> amd64)
-          ARCH=$(echo "${{ matrix.platform }}" | cut -d'/' -f2)
+          # Use architecture from matrix
+          ARCH="${{ matrix.arch }}"
           echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
 
           # Create platform-specific tag
-          if [ "${{ matrix.variant.name }}" = "full" ]; then
+          if [ "${{ matrix.variant_name }}" = "full" ]; then
             TAG="latest-$ARCH"
           else
-            TAG="${{ matrix.variant.name }}-$ARCH"
+            TAG="${{ matrix.variant_name }}-$ARCH"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
           # Create cache key
-          CACHE_KEY="${{ matrix.variant.name }}-$ARCH"
+          CACHE_KEY="${{ matrix.variant_name }}-$ARCH"
           echo "cache_key=$CACHE_KEY" >> "$GITHUB_OUTPUT"
-
-      # -----------------------------------------------------------
-      # Set up QEMU for cross-platform builds
-      # -----------------------------------------------------------
-      - name: 🔧 Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: ${{ matrix.platform }}
 
       # -----------------------------------------------------------
       # Set up Docker Buildx
@@ -173,11 +187,11 @@ jobs:
       # -----------------------------------------------------------
       # Build and push platform-specific image
       # -----------------------------------------------------------
-      - name: 🏗️ Build and push (${{ matrix.variant.name }} / ${{ matrix.platform }})
+      - name: 🏗️ Build and push (${{ matrix.variant_name }} / ${{ matrix.platform }})
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.variant.file }}
+          file: ${{ matrix.variant_file }}
           platforms: ${{ matrix.platform }}
           push: ${{ steps.push_check.outputs.should_push == 'true' }}
           tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
@@ -194,19 +208,19 @@ jobs:
       - name: 📤 Export digest
         if: steps.push_check.outputs.should_push == 'true'
         run: |
-          mkdir -p /tmp/digests/${{ matrix.variant.name }}
+          mkdir -p /tmp/digests/${{ matrix.variant_name }}
           DIGEST=$(docker buildx imagetools inspect \
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }} \
             --format '{{json .Manifest.Digest}}' | tr -d '"')
-          echo "$DIGEST" > /tmp/digests/${{ matrix.variant.name }}/${{ steps.meta.outputs.arch }}
-          echo "Digest for ${{ matrix.variant.name }}/${{ steps.meta.outputs.arch }}: $DIGEST"
+          echo "$DIGEST" > /tmp/digests/${{ matrix.variant_name }}/${{ steps.meta.outputs.arch }}
+          echo "Digest for ${{ matrix.variant_name }}/${{ steps.meta.outputs.arch }}: $DIGEST"
 
       - name: 📁 Upload digest artifact
         if: steps.push_check.outputs.should_push == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ matrix.variant.name }}-${{ steps.meta.outputs.arch }}
-          path: /tmp/digests/${{ matrix.variant.name }}/*
+          name: digest-${{ matrix.variant_name }}-${{ steps.meta.outputs.arch }}
+          path: /tmp/digests/${{ matrix.variant_name }}/*
           retention-days: 1
 
   # =============================================================
