@@ -130,15 +130,45 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # -----------------------------------------------------------
-      # Log in to GHCR (skip for PRs from forks)
+      # Log in to GHCR
+      # Skip only for PRs from external forks (they don't have write access)
+      # PRs within the same repo and direct pushes can login
       # -----------------------------------------------------------
       - name: 🔑 Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: |
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------
+      # Determine if we should push
+      # Push on: direct push to main, OR PRs within same repo (not from forks)
+      # -----------------------------------------------------------
+      - name: 🔍 Check if push is allowed
+        id: push_check
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            # Direct push or workflow_dispatch or schedule
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              echo "should_push=true" >> "$GITHUB_OUTPUT"
+              echo "Push allowed: direct push to main"
+            else
+              echo "should_push=false" >> "$GITHUB_OUTPUT"
+              echo "Push skipped: not main branch"
+            fi
+          elif [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+            # PR from same repo (not a fork) - allow push for testing
+            echo "should_push=true" >> "$GITHUB_OUTPUT"
+            echo "Push allowed: PR from same repo"
+          else
+            # PR from external fork - no push access
+            echo "should_push=false" >> "$GITHUB_OUTPUT"
+            echo "Push skipped: PR from external fork"
+          fi
 
       # -----------------------------------------------------------
       # Build and push platform-specific image
@@ -149,7 +179,7 @@ jobs:
           context: .
           file: ${{ matrix.variant.file }}
           platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+          push: ${{ steps.push_check.outputs.should_push == 'true' }}
           tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
           build-args: |
             ENABLE_RUST=${{ env.ENABLE_RUST }}
@@ -162,7 +192,7 @@ jobs:
       # Export digest for manifest creation
       # -----------------------------------------------------------
       - name: 📤 Export digest
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: steps.push_check.outputs.should_push == 'true'
         run: |
           mkdir -p /tmp/digests/${{ matrix.variant.name }}
           DIGEST=$(docker buildx imagetools inspect \
@@ -172,7 +202,7 @@ jobs:
           echo "Digest for ${{ matrix.variant.name }}/${{ steps.meta.outputs.arch }}: $DIGEST"
 
       - name: 📁 Upload digest artifact
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: steps.push_check.outputs.should_push == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: digest-${{ matrix.variant.name }}-${{ steps.meta.outputs.arch }}
@@ -181,10 +211,13 @@ jobs:
 
   # =============================================================
   # Create multi-arch manifests
+  # Runs on: push to main, OR PRs within same repo (not from forks)
   # =============================================================
   manifest:
     needs: build
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: |
+      (github.event_name != 'pull_request' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -278,7 +311,9 @@ jobs:
   # =============================================================
   sign:
     needs: manifest
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: |
+      (github.event_name != 'pull_request' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
 
     steps:
@@ -314,7 +349,9 @@ jobs:
   # =============================================================
   scan:
     needs: manifest
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: |
+      (github.event_name != 'pull_request' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -360,7 +397,11 @@ jobs:
   # =============================================================
   summary:
     needs: [build, manifest, sign, scan]
-    if: always() && github.event_name != 'pull_request'
+    if: |
+      always() && (
+        (github.event_name != 'pull_request') ||
+        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      )
     runs-on: ubuntu-latest
 
     steps:
