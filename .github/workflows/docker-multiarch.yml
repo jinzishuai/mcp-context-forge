@@ -1,0 +1,450 @@
+# ===============================================================
+# 🏗️ Multi-Architecture Docker Build Workflow
+# ===============================================================
+#
+# This workflow builds both Containerfile and Containerfile.lite
+# for AMD64 and ARM64 architectures and pushes multi-arch manifests
+# to GitHub Container Registry (GHCR).
+#
+# Images produced:
+#   - ghcr.io/OWNER/REPO:latest           (full image, multi-arch)
+#   - ghcr.io/OWNER/REPO:lite             (lite image, multi-arch)
+#   - ghcr.io/OWNER/REPO:latest-amd64     (full image, amd64 only)
+#   - ghcr.io/OWNER/REPO:latest-arm64     (full image, arm64 only)
+#   - ghcr.io/OWNER/REPO:lite-amd64       (lite image, amd64 only)
+#   - ghcr.io/OWNER/REPO:lite-arm64       (lite image, arm64 only)
+#
+# Triggers:
+#   - Push to main branch
+#   - Pull requests to main (build only, no push)
+#   - Manual workflow dispatch
+#   - Weekly scheduled run (Sunday 00:00 UTC)
+# ---------------------------------------------------------------
+
+name: Multi-Arch Docker Build
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      enable_rust:
+        description: 'Enable Rust plugin builds'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  schedule:
+    - cron: "0 0 * * 0" # Sunday @ 00:00 UTC
+
+# -----------------------------------------------------------------
+# Minimal permissions - principle of least privilege
+# -----------------------------------------------------------------
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  actions: read
+  id-token: write
+
+# -----------------------------------------------------------------
+# Concurrency: Cancel in-progress runs for the same branch
+# -----------------------------------------------------------------
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  # Enable Rust builds via workflow_dispatch or default to false
+  ENABLE_RUST: ${{ github.event.inputs.enable_rust || 'false' }}
+
+jobs:
+  # =============================================================
+  # Build job - Matrix strategy for variant × architecture
+  # Uses native runners for each architecture (no QEMU emulation)
+  # AMD64 builds on ubuntu-24.04, ARM64 builds on ubuntu-24.04-arm
+  # =============================================================
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Full variant - AMD64
+          - variant_name: full
+            variant_file: Containerfile
+            variant_suffix: ""
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          # Full variant - ARM64
+          - variant_name: full
+            variant_file: Containerfile
+            variant_suffix: ""
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+          # Lite variant - AMD64
+          - variant_name: lite
+            variant_file: Containerfile.lite
+            variant_suffix: "-lite"
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          # Lite variant - ARM64
+          - variant_name: lite
+            variant_file: Containerfile.lite
+            variant_suffix: "-lite"
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      # -----------------------------------------------------------
+      # Checkout source
+      # -----------------------------------------------------------
+      - name: ⬇️ Checkout code
+        uses: actions/checkout@v5
+
+      # -----------------------------------------------------------
+      # Derive image name and platform-specific tag
+      # -----------------------------------------------------------
+      - name: 🏷️ Set image metadata
+        id: meta
+        run: |
+          IMAGE="${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          # Use architecture from matrix
+          ARCH="${{ matrix.arch }}"
+          echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+
+          # Create platform-specific tag
+          if [ "${{ matrix.variant_name }}" = "full" ]; then
+            TAG="latest-$ARCH"
+          else
+            TAG="${{ matrix.variant_name }}-$ARCH"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Create cache key
+          CACHE_KEY="${{ matrix.variant_name }}-$ARCH"
+          echo "cache_key=$CACHE_KEY" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------
+      # Set up Docker Buildx
+      # -----------------------------------------------------------
+      - name: 🛠️ Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # -----------------------------------------------------------
+      # Log in to GHCR
+      # Skip only for PRs from external forks (they don't have write access)
+      # PRs within the same repo and direct pushes can login
+      # -----------------------------------------------------------
+      - name: 🔑 Log in to GHCR
+        if: |
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------
+      # Determine if we should push
+      # Push on: direct push to main, OR PRs within same repo (not from forks)
+      # -----------------------------------------------------------
+      - name: 🔍 Check if push is allowed
+        id: push_check
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            # Direct push or workflow_dispatch or schedule
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              echo "should_push=true" >> "$GITHUB_OUTPUT"
+              echo "Push allowed: direct push to main"
+            else
+              echo "should_push=false" >> "$GITHUB_OUTPUT"
+              echo "Push skipped: not main branch"
+            fi
+          elif [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+            # PR from same repo (not a fork) - allow push for testing
+            echo "should_push=true" >> "$GITHUB_OUTPUT"
+            echo "Push allowed: PR from same repo"
+          else
+            # PR from external fork - no push access
+            echo "should_push=false" >> "$GITHUB_OUTPUT"
+            echo "Push skipped: PR from external fork"
+          fi
+
+      # -----------------------------------------------------------
+      # Build and push platform-specific image
+      # -----------------------------------------------------------
+      - name: 🏗️ Build and push (${{ matrix.variant_name }} / ${{ matrix.platform }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.variant_file }}
+          platforms: ${{ matrix.platform }}
+          push: ${{ steps.push_check.outputs.should_push == 'true' }}
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            ENABLE_RUST=${{ env.ENABLE_RUST }}
+          cache-from: type=gha,scope=${{ steps.meta.outputs.cache_key }}
+          cache-to: type=gha,mode=max,scope=${{ steps.meta.outputs.cache_key }}
+          provenance: true
+          sbom: true
+
+      # -----------------------------------------------------------
+      # Export digest for manifest creation
+      # -----------------------------------------------------------
+      - name: 📤 Export digest
+        if: steps.push_check.outputs.should_push == 'true'
+        run: |
+          mkdir -p /tmp/digests/${{ matrix.variant_name }}
+          DIGEST=$(docker buildx imagetools inspect \
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }} \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "$DIGEST" > /tmp/digests/${{ matrix.variant_name }}/${{ steps.meta.outputs.arch }}
+          echo "Digest for ${{ matrix.variant_name }}/${{ steps.meta.outputs.arch }}: $DIGEST"
+
+      - name: 📁 Upload digest artifact
+        if: steps.push_check.outputs.should_push == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.variant_name }}-${{ steps.meta.outputs.arch }}
+          path: /tmp/digests/${{ matrix.variant_name }}/*
+          retention-days: 1
+
+  # =============================================================
+  # Create multi-arch manifests
+  # Runs on: push to main, OR PRs within same repo (not from forks)
+  # =============================================================
+  manifest:
+    needs: build
+    if: |
+      (github.event_name != 'pull_request' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variant:
+          - name: full
+            tag: latest
+          - name: lite
+            tag: lite
+
+    steps:
+      - name: 🏷️ Set image name
+        id: meta
+        run: |
+          IMAGE="${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------
+      # Log in to GHCR
+      # -----------------------------------------------------------
+      - name: 🔑 Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------
+      # Set up Docker Buildx for manifest commands
+      # -----------------------------------------------------------
+      - name: 🛠️ Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # -----------------------------------------------------------
+      # Create and push multi-arch manifest
+      # -----------------------------------------------------------
+      - name: 📦 Create multi-arch manifest (${{ matrix.variant.tag }})
+        run: |
+          IMAGE="${{ steps.meta.outputs.image }}"
+          TAG="${{ matrix.variant.tag }}"
+
+          # Determine source tags based on variant
+          if [ "$TAG" = "latest" ]; then
+            AMD64_TAG="latest-amd64"
+            ARM64_TAG="latest-arm64"
+          else
+            AMD64_TAG="${TAG}-amd64"
+            ARM64_TAG="${TAG}-arm64"
+          fi
+
+          echo "Creating manifest $IMAGE:$TAG from:"
+          echo "  - $IMAGE:$AMD64_TAG"
+          echo "  - $IMAGE:$ARM64_TAG"
+
+          # Create and push the manifest
+          docker buildx imagetools create \
+            --tag "$IMAGE:$TAG" \
+            "$IMAGE:$AMD64_TAG" \
+            "$IMAGE:$ARM64_TAG"
+
+      # -----------------------------------------------------------
+      # Also tag with timestamp for versioning
+      # -----------------------------------------------------------
+      - name: 🏷️ Create timestamped tag
+        run: |
+          IMAGE="${{ steps.meta.outputs.image }}"
+          TAG="${{ matrix.variant.tag }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+          if [ "$TAG" = "latest" ]; then
+            VERSIONED_TAG="$TIMESTAMP"
+          else
+            VERSIONED_TAG="${TAG}-$TIMESTAMP"
+          fi
+
+          echo "Creating versioned manifest $IMAGE:$VERSIONED_TAG"
+
+          docker buildx imagetools create \
+            --tag "$IMAGE:$VERSIONED_TAG" \
+            "$IMAGE:$TAG"
+
+      # -----------------------------------------------------------
+      # Inspect the manifest
+      # -----------------------------------------------------------
+      - name: 🔍 Inspect manifest
+        run: |
+          docker buildx imagetools inspect \
+            ${{ steps.meta.outputs.image }}:${{ matrix.variant.tag }}
+
+  # =============================================================
+  # Sign images with Cosign (keyless OIDC)
+  # =============================================================
+  sign:
+    needs: manifest
+    if: |
+      (github.event_name != 'pull_request' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🏷️ Set image name
+        id: meta
+        run: |
+          IMAGE="${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: 🔑 Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📥 Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: 🔏 Sign images
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          IMAGE="${{ steps.meta.outputs.image }}"
+
+          for TAG in latest lite; do
+            echo "🔑 Signing $IMAGE:$TAG"
+            cosign sign --yes "$IMAGE:$TAG"
+          done
+
+  # =============================================================
+  # Security scan with Grype
+  # =============================================================
+  scan:
+    needs: manifest
+    if: |
+      (github.event_name != 'pull_request' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: [latest, lite]
+
+    steps:
+      - name: ⬇️ Checkout code
+        uses: actions/checkout@v5
+
+      - name: 🏷️ Set image name
+        id: meta
+        run: |
+          IMAGE="${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: 📥 Install Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: 🔍 Scan image (${{ matrix.tag }})
+        continue-on-error: true
+        run: |
+          grype ${{ steps.meta.outputs.image }}:${{ matrix.tag }} \
+            --scope all-layers \
+            --only-fixed
+
+      - name: 📄 Generate SARIF report
+        run: |
+          grype ${{ steps.meta.outputs.image }}:${{ matrix.tag }} \
+            --scope all-layers \
+            --output sarif \
+            --file grype-${{ matrix.tag }}.sarif
+
+      - name: ☁️ Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: grype-${{ matrix.tag }}.sarif
+          category: grype-${{ matrix.tag }}
+
+  # =============================================================
+  # Summary job
+  # =============================================================
+  summary:
+    needs: [build, manifest, sign, scan]
+    if: |
+      always() && (
+        (github.event_name != 'pull_request') ||
+        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📊 Build Summary
+        run: |
+          IMAGE="${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+
+          echo "## 🐳 Multi-Arch Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Images Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | Architectures | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|---------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`$IMAGE:latest\` | amd64, arm64 | ${{ needs.manifest.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`$IMAGE:lite\` | amd64, arm64 | ${{ needs.manifest.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Platform-Specific Tags" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$IMAGE:latest-amd64\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$IMAGE:latest-arm64\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$IMAGE:lite-amd64\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$IMAGE:lite-arm64\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Manifest | ${{ needs.manifest.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Sign | ${{ needs.sign.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan | ${{ needs.scan.result }} |" >> $GITHUB_STEP_SUMMARY
+
